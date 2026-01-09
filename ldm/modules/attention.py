@@ -162,6 +162,11 @@ class CrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
+        self.to_sigma = nn.Sequential(
+            nn.Linear(query_dim, heads),
+            nn.Sigmoid()  # 限制在 0~1 之间，防止出现负数或过大值
+        )
+
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
@@ -176,8 +181,16 @@ class CrossAttention(nn.Module):
         v = self.to_v(context)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+        # 1. 计算 sigma: (batch, seq_len, heads)
+        sigma = self.to_sigma(x)
+
+        # 2. 调整维度以便广播: (batch*heads, seq_len, 1)
+        sigma = rearrange(sigma, 'b i h -> (b h) i 1')
+
+        # 3. 核心逻辑：分越高越小 (方差越大，分布越平，分值被除得越小)
+        sim = sim / (sigma + 1e-6)
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
