@@ -16,7 +16,16 @@ from contextlib import contextmanager
 from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.distributed import rank_zero_only
+# from pytorch_lightning.utilities.distributed import rank_zero_only
+try:
+    from pytorch_lightning.utilities.distributed import rank_zero_only
+except Exception:
+    try:
+        from pytorch_lightning.utilities.rank_zero import rank_zero_only
+    except Exception:
+        # Lightning 不存在时的兜底
+        def rank_zero_only(fn):
+            return fn
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
