@@ -183,14 +183,18 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        # 1. 计算 sigma: (batch, seq_len, heads)
+        # 1. 计算 sigma: (batch, seq_len, 1)      🔧 改动1：输出改为1，不再是heads个
         sigma = self.to_sigma(x)
 
-        # 2. 调整维度以便广播: (batch*heads, seq_len, 1)
-        sigma = rearrange(sigma, 'b i h -> (b h) i 1')
+        # 2. softplus 保证为正，clamp 限制范围    🔧 改动2：替换掉 +1e-6
+        sigma = F.softplus(sigma)
+        sigma = sigma.clamp(min=self.scale * 0.1, max=self.scale * 10.0)
 
-        # 3. 核心逻辑：分越高越小 (方差越大，分布越平，分值被除得越小)
-        sim = sim / (sigma + 1e-6)
+        # 3. 调整维度以便广播: (batch*heads, seq_len, 1)   🔧 改动3：h 从维度名改为参数
+        sigma = rearrange(sigma, 'b i 1 -> (b h) i 1', h=h)
+
+        # 核心逻辑：分越高越小 (方差越大，分布越平，分值被除得越小)
+        sim = sim / sigma
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
