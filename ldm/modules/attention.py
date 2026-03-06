@@ -162,10 +162,10 @@ class CrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.to_sigma = nn.Sequential(
-            nn.Linear(query_dim, heads),
-            nn.Sigmoid()  # 限制在 0~1 之间，防止出现负数或过大值
-        )
+        self.to_sigma = nn.Linear(query_dim, 1, bias=True)
+        nn.init.zeros_(self.to_sigma.weight)
+        nn.init.constant_(self.to_sigma.bias, self.scale)
+
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
