@@ -191,7 +191,7 @@ class CrossAttention(nn.Module):
         sigma = sigma.clamp(min=self.scale * 0.1, max=self.scale * 10.0)
 
         # 3. 调整维度以便广播: (batch*heads, seq_len, 1)   🔧 改动3：h 从维度名改为参数
-        sigma = rearrange(sigma, 'b i 1 -> (b h) i 1', h=h)
+        sigma = sigma.repeat_interleave(h, dim=0)   # (b, n, 1) → (b*h, n, 1)
 
         # 核心逻辑：分越高越小 (方差越大，分布越平，分值被除得越小)
         sim = sim / sigma
