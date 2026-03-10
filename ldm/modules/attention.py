@@ -154,7 +154,6 @@ class CrossAttention(nn.Module):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
-
         self.scale = dim_head ** -0.5
         self.heads = heads
 
@@ -162,10 +161,8 @@ class CrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.to_sigma = nn.Linear(query_dim, 1, bias=True)
-        nn.init.zeros_(self.to_sigma.weight)
-        nn.init.constant_(self.to_sigma.bias, self.scale)
-
+        # 可学习噪声强度，初始化为小值保证训练早期稳定
+        self.noise_scale = nn.Parameter(torch.full((1,), 0.1))
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
@@ -181,28 +178,34 @@ class CrossAttention(nn.Module):
         v = self.to_v(context)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        # 1. 标准 sim（QK 分数）
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        # 1. 计算 sigma: (batch, seq_len, 1)      🔧 改动1：输出改为1，不再是heads个
-        sigma = self.to_sigma(x)
-
-        # 2. softplus 保证为正，clamp 限制范围    🔧 改动2：替换掉 +1e-6
-        sigma = F.softplus(sigma)
-        sigma = sigma.clamp(min=self.scale * 0.1, max=self.scale * 10.0)
-
-        # 3. 调整维度以便广播: (batch*heads, seq_len, 1)   🔧 改动3：h 从维度名改为参数
-        sigma = sigma.repeat_interleave(h, dim=0)   # (b, n, 1) → (b*h, n, 1)
-
-        # 核心逻辑：分越高越小 (方差越大，分布越平，分值被除得越小)
-        sim = sim / sigma
-
+        # 2. mask 提前，保证 prob 计算不被 padding 污染
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
             max_neg_value = -torch.finfo(sim.dtype).max
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
+        # 3. 基于 sim 计算标准 attention prob
+        prob = sim.softmax(dim=-1)
+
+        # 4. score-dependent variance：prob 越低越不确定，方差越大
+        noise_scale = F.softplus(self.noise_scale)          # 保证为正
+        variance = (1 - prob) * noise_scale
+        variance = variance.clamp(1e-6, 0.1)                # 防止 std=0 或噪声过大
+
+        # 5. 训练时在 sim 上叠加零均值高斯噪声
+        if self.training:
+            std = variance.sqrt()
+            sim = sim + torch.randn_like(sim) * std
+            # 加噪后重新 mask，防止 padding 位置被噪声拉回
+            if exists(mask):
+                sim.masked_fill_(~mask, max_neg_value)
+
+        # 6. 最终 softmax
         attn = sim.softmax(dim=-1)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
