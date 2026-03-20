@@ -195,7 +195,7 @@ class CrossAttention(nn.Module):
         # 4. score-dependent variance：prob 越低越不确定，方差越大
         noise_scale = F.softplus(self.noise_scale)          # 保证为正
         variance = (1 - prob) * noise_scale
-        variance = variance.clamp(1e-6, 0.1)                # 防止 std=0 或噪声过大
+        variance = variance.clamp(1e-6, 0.02)                # 防止 std=0 或噪声过大
 
         # 5. 训练时在 sim 上叠加零均值高斯噪声
         if self.training:
