@@ -162,7 +162,7 @@ class CrossAttention(nn.Module):
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
         # 可学习噪声强度，初始化为小值保证训练早期稳定
-        self.noise_scale = nn.Parameter(torch.full((1,), 0.1))
+        self.noise_scale = nn.Parameter(torch.full((heads, 1, 1), 0.1))
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
@@ -171,6 +171,7 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
+        b = x.shape[0]  # 获取 Batch Size
 
         q = self.to_q(x)
         context = default(context, x)
@@ -193,14 +194,13 @@ class CrossAttention(nn.Module):
         prob = sim.softmax(dim=-1)
 
         # 4. score-dependent variance：prob 越低越不确定，方差越大
-        noise_scale = F.softplus(self.noise_scale)          # 保证为正
-        variance = (1 - prob) * noise_scale
-        variance = variance.clamp(1e-6, 0.02)                # 防止 std=0 或噪声过大
+        scale = F.softplus(self.noise_scale)
+        variance = (1.0 - prob.view(b, h, -1, prob.shape[-1])) * scale.view(1, h, 1, 1)
+        variance = variance.view_as(prob).clamp(1e-6, 0.02)            # 防止 std=0 或噪声过大
 
         # 5. 训练时在 sim 上叠加零均值高斯噪声
         if self.training:
-            std = variance.sqrt()
-            sim = sim + torch.randn_like(sim) * std
+            sim.add_(torch.randn_like(sim) * variance.sqrt())
             # 加噪后重新 mask，防止 padding 位置被噪声拉回
             if exists(mask):
                 sim.masked_fill_(~mask, max_neg_value)
