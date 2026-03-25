@@ -161,8 +161,7 @@ class CrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        # 可学习噪声强度，初始化为小值保证训练早期稳定
-        self.noise_scale = nn.Parameter(torch.full((heads, 1, 1), 0.1))
+        self.noise_scale = nn.Parameter(torch.full((heads, 1, 1), -2.0))
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
@@ -171,7 +170,7 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
-        b = x.shape[0]  # 获取 Batch Size
+        b = x.shape[0]
 
         q = self.to_q(x)
         context = default(context, x)
@@ -180,34 +179,31 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        # 1. 标准 sim（QK 分数）
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        # 2. mask 提前，保证 prob 计算不被 padding 污染
+        # 提前定义，两处 mask 都能用
+        max_neg_value = -torch.finfo(sim.dtype).max
+
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
-        # 3. 基于 sim 计算标准 attention prob
-        prob = sim.softmax(dim=-1)
-
-        # 4. score-dependent variance：prob 越低越不确定，方差越大
-        scale = F.softplus(self.noise_scale)
-        variance = (1.0 - prob.view(b, h, -1, prob.shape[-1])) * scale.view(1, h, 1, 1)
-        variance = variance.view_as(prob).clamp(1e-6, 0.02)            # 防止 std=0 或噪声过大
-
-        # 5. 训练时在 sim 上叠加零均值高斯噪声
         if self.training:
-            sim.add_(torch.randn_like(sim) * variance.sqrt())
-            # 加噪后重新 mask，防止 padding 位置被噪声拉回
+            with torch.no_grad():
+                prob    = sim.softmax(dim=-1)
+                ns      = F.softplus(self.noise_scale)       # (h, 1, 1)
+                prob_4d = prob.view(b, h, -1, prob.shape[-1])
+                std_4d  = ((1.0 - prob_4d) * ns).clamp(min=0).sqrt().clamp(max=0.1)
+                std     = std_4d.view_as(sim)
+
+            sim.add_(torch.randn_like(sim) * std)            # ← no_grad 外，梯度正常
+            del prob, prob_4d, std_4d, std
+
             if exists(mask):
                 sim.masked_fill_(~mask, max_neg_value)
 
-        # 6. 最终 softmax
         attn = sim.softmax(dim=-1)
-
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
