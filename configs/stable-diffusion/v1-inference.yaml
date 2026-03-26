@@ -2,6 +2,9 @@ model:
   base_learning_rate: 1.0e-04
   target: ldm.models.diffusion.ddpm.LatentDiffusion
   params:
+    ckpt_path: "E:/python_workspace/stable-diffusion/models/ldm/stable-diffusion-v1/sd-v1-4.ckpt"
+
+
     linear_start: 0.00085
     linear_end: 0.0120
     num_timesteps_cond: 1
@@ -68,3 +71,5 @@ model:
 
     cond_stage_config:
       target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+      params:
+        version: "E:/python_workspace/stable-diffusion/models/clip-vit-large-patch14"
