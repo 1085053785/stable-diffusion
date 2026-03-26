@@ -150,27 +150,65 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.,
+                 max_seq_len=256, sigma_init=0.05, bias_scale_init=10.0,
+                 learnable_sigma=True):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
         self.scale = dim_head ** -0.5
         self.heads = heads
+        self.is_self_attn = (context_dim == query_dim)   # ← 判断是否是自注意力
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.noise_scale = nn.Parameter(torch.full((heads, 1, 1), -2.0))
+        # ── 只有自注意力才初始化偏置相关参数 ────────────────────────────
+        if self.is_self_attn:
+            pos = torch.arange(max_seq_len).float()
+            self.register_buffer('pos', pos)
+            self.max_seq_len     = max_seq_len
+            self.learnable_sigma = learnable_sigma
+            sigma = sigma_init * max_seq_len
+
+            if learnable_sigma:
+                self.log_sigma = nn.Parameter(
+                    torch.full((heads, 1, 1), math.log(sigma))
+                )
+            else:
+                p    = torch.arange(max_seq_len).float()
+                dist = (p.unsqueeze(0) - p.unsqueeze(1)).abs()
+                init = torch.exp(-0.5 * (dist / sigma) ** 2)
+                init = init.unsqueeze(0).expand(heads, -1, -1).clone()  # (h, L, L)
+                self.attn_bias = nn.Parameter(init)
+
+            self.bias_scale = nn.Parameter(
+                torch.full((heads, 1, 1), math.log(bias_scale_init))
+            )
+        # ────────────────────────────────────────────────────────────────
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
 
+    def _get_bias(self, n):
+        """ 只在自注意力时调用，shape: (h, n, n) """
+        p    = self.pos[:n]
+        dist = (p.unsqueeze(0) - p.unsqueeze(1)).abs()           # (n, n)
+
+        if self.learnable_sigma:
+            sigma = self.log_sigma.exp()                          # (h, 1, 1)
+            bias  = torch.exp(-0.5 * (dist / sigma) ** 2)        # (h, n, n)
+        else:
+            bias = self.attn_bias[:, :n, :n]                     # (h, n, n)
+
+        return bias * self.bias_scale.exp()                       # (h, n, n)
+
     def forward(self, x, context=None, mask=None):
         h = self.heads
-        b = x.shape[0]
+        b, n, _ = x.shape
 
         q = self.to_q(x)
         context = default(context, x)
@@ -181,7 +219,13 @@ class CrossAttention(nn.Module):
 
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        # 提前定义，两处 mask 都能用
+        # ── 只有自注意力加偏置，交叉注意力跳过 ──────────────────────────
+        if self.is_self_attn:
+            bias = self._get_bias(n)                              # (h, n, n)
+            sim  = sim.view(b, h, n, n) + bias                   # 广播，零拷贝
+            sim  = sim.view(b * h, n, n)
+        # ────────────────────────────────────────────────────────────────
+
         max_neg_value = -torch.finfo(sim.dtype).max
 
         if exists(mask):
@@ -189,24 +233,11 @@ class CrossAttention(nn.Module):
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
-        if self.training:
-            with torch.no_grad():
-                prob    = sim.softmax(dim=-1)
-                ns      = F.softplus(self.noise_scale)       # (h, 1, 1)
-                prob_4d = prob.view(b, h, -1, prob.shape[-1])
-                std_4d  = ((1.0 - prob_4d) * ns).clamp(min=0).sqrt().clamp(max=0.1)
-                std     = std_4d.view_as(sim)
-
-            sim.add_(torch.randn_like(sim) * std)            # ← no_grad 外，梯度正常
-            del prob, prob_4d, std_4d, std
-
-            if exists(mask):
-                sim.masked_fill_(~mask, max_neg_value)
-
         attn = sim.softmax(dim=-1)
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        out  = einsum('b i j, b j d -> b i d', attn, v)
+        out  = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
+
 
 
 class BasicTransformerBlock(nn.Module):
